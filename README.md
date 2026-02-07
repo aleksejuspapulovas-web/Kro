@@ -1,0 +1,11 @@
+# requirements.txt
+torch
+sentence-transformers
+transformers
+gradio
+aiohttp
+feedparser
+matplotlib
+numpy
+faiss-cpu
+pandas
