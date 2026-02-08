@@ -341,4 +341,8 @@ with gr.Blocks() as demo:
     btn.click(chat, txt, out)
     auto_btn.click(start_auto, outputs=auto_out)
 
-demo.launch()
+demo.launch(
+server_name="0.0.0.0",
+server_port=7860,
+share=False
+)
