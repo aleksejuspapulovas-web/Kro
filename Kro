@@ -343,12 +343,16 @@ with gr.Blocks() as demo:
 
 import os
 
-# ... (весь остальной код)
+# ... (весь остальной код выше)
 
 if __name__ == "__main__":
-    port = int(os.environ.get(PORT, 7860))  # Render передаёт свой PORT, fallback на 7860
+    # Render передаёт свой порт через переменную PORT
+    port = int(os.environ.get("PORT", 7860))  # fallback на 7860 для локального запуска
+    print(f"Starting Gradio on port {port}...")  # ← для логов, увидишь в Render
+    
     demo.launch(
-        server_name="0.0.0.0",
-        server_port=port,          # ← используем $PORT от Render
-        share=False
+        server_name="0.0.0.0",      # ← обязательно
+        server_port=port,           # ← используем $PORT от Render
+        share=False,
+        debug=False                 # ← отключи debug на проде
     )
