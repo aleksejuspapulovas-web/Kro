@@ -1,4 +1,4 @@
-# main.py — KRO v30.3 — максимально стабильная версия (Render/Railway-ready)
+# main.py — KRO v30.4 — финальная стабильная версия для Render/Railway
 
 import os
 import json
@@ -12,7 +12,7 @@ from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# Твой ключ
+# Твой ключ (не коммить в GitHub!)
 GROQ_API_KEY = "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"
 
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -185,5 +185,6 @@ app.mount("/", gradio_interface)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"Запуск KRO v30 на порту {port}")
+    print(f"Render PORT: {os.environ.get('PORT', 'not set')}")
+    print(f"Starting KRO v30 on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
