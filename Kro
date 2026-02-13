@@ -1,4 +1,4 @@
-# main.py — KRO v30.1 — исправленная и стабильная версия
+# main.py — KRO v30.2 — чистая рабочая версия (Render-ready)
 
 import os
 import json
@@ -12,41 +12,35 @@ import gradio as gr
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 from langchain_huggingface import HuggingFaceEmbeddings
-import torch
-import hashlib  # для генерации id
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Твой ключ (не коммить в GitHub!)
+GROQ_API_KEY = "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"
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+def llm_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
+    try:
+        resp = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-70b-versatile",
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Groq error: {e}")
+        return "KRO: LLM недоступен."
+
+DEVICE = "cpu"  # упрощаем, Render обычно без GPU
 print(f"Device: {DEVICE}")
 
 DATA_DIR = "/data"
-STATE_PATH = f"{DATA_DIR}/kro_v30_state.json"
 CONVERSATION_COLLECTION = "kro_conversation"
 ARCHIVE_DIR = f"{DATA_DIR}/conversation_archive"
 LAST_COMPRESS_PATH = f"{DATA_DIR}/last_compress.json"
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
-
-# Groq
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-USE_GROQ = bool(GROQ_API_KEY)
-
-if USE_GROQ:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-
-def llm_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
-    if USE_GROQ:
-        try:
-            resp = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.1-70b-versatile",
-                max_tokens=max_tokens,
-                temperature=temperature
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"Groq error: {e}. Использую fallback.")
-    return "KRO: LLM недоступен."
 
 # Embedding + Chroma
 embedder = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
@@ -58,19 +52,18 @@ vectorstore = Chroma(
     persist_directory=f"{DATA_DIR}/chroma_db"
 )
 
-# ============================================================
-# KRO Core
-# ============================================================
-
 class KRO:
     def __init__(self):
         self.step_id = 0
         self.last_compress_time = datetime.now() - timedelta(days=8)
 
         if os.path.exists(LAST_COMPRESS_PATH):
-            with open(LAST_COMPRESS_PATH, "r") as f:
-                info = json.load(f)
-                self.last_compress_time = datetime.fromisoformat(info["last_compress"])
+            try:
+                with open(LAST_COMPRESS_PATH, "r") as f:
+                    info = json.load(f)
+                    self.last_compress_time = datetime.fromisoformat(info["last_compress"])
+            except:
+                pass
 
     def should_compress(self):
         return (datetime.now() - self.last_compress_time).days >= 7
@@ -82,12 +75,12 @@ class KRO:
         if len(old_docs) < 50:
             return
 
-        old_text = "\n".join(old_docs[-300:])  # последние 300 для контекста
+        old_text = "\n".join(old_docs[-300:])
         if len(old_text) > 30000:
             old_text = old_text[:30000]
 
         prompt = f"""Суммаризируй эту историю разговора в 400–600 слов.
-Выдели ключевые темы, эмоции, важные события и все упомянутые якоря.
+Выдели ключевые темы, эмоции, важные события.
 Сохрани суть взаимодействия.
 
 Сообщения:
@@ -99,8 +92,11 @@ class KRO:
         archive_path = f"{ARCHIVE_DIR}/archive_{month_key}.json"
         archive = []
         if os.path.exists(archive_path):
-            with open(archive_path, "r", encoding="utf-8") as f:
-                archive = json.load(f)
+            try:
+                with open(archive_path, "r", encoding="utf-8") as f:
+                    archive = json.load(f)
+            except:
+                pass
         archive.append({
             "period": f"{results['metadatas'][0]['timestamp']} → {results['metadatas'][-1]['timestamp']}",
             "summary": summary,
@@ -111,10 +107,10 @@ class KRO:
 
         print(f"[Сжатие] {len(old_docs)} сообщений → {archive_path}")
 
-        # Удаляем старые документы
-        vectorstore.delete(ids=results.get("ids", []))
+        ids_to_delete = results.get("ids", [])
+        if ids_to_delete:
+            vectorstore.delete(ids=ids_to_delete)
 
-        # Добавляем summary
         summary_doc = Document(
             page_content=summary,
             metadata={"type": "summary", "timestamp": datetime.now().isoformat()}
@@ -127,22 +123,22 @@ class KRO:
 
     def add_to_history(self, user_text: str, kro_reply: str):
         timestamp = datetime.now().isoformat()
-        id_user = hashlib.sha256(f"user_{timestamp}_{user_text[:100]}".encode()).hexdigest()
-        id_kro = hashlib.sha256(f"kro_{timestamp}_{kro_reply[:100]}".encode()).hexdigest()
-
         doc_user = Document(
             page_content=user_text,
-            metadata={"role": "user", "timestamp": timestamp, "id": id_user}
+            metadata={"role": "user", "timestamp": timestamp}
         )
         doc_kro = Document(
             page_content=kro_reply,
-            metadata={"role": "kro", "timestamp": timestamp, "id": id_kro}
+            metadata={"role": "kro", "timestamp": timestamp}
         )
         vectorstore.add_documents([doc_user, doc_kro])
 
     def search_history(self, query: str, k=5):
-        results = vectorstore.similarity_search(query, k=k)
-        return [doc.page_content for doc in results]
+        try:
+            results = vectorstore.similarity_search(query, k=k)
+            return [doc.page_content for doc in results]
+        except:
+            return []
 
     def step(self, text: str):
         self.step_id += 1
@@ -185,8 +181,8 @@ gradio_interface = gr.Interface(
 )
 
 app.mount("/", gradio_interface)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    print(f"Starting KRO on http://0.0.0.0:{port}")
-    print(f"Render PORT variable: {os.environ.get('PORT', 'not set')}")
+    print(f"Запуск KRO v30 на порту {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
