@@ -1,358 +1,192 @@
-# -*- coding: utf-8 -*-
-"""
-KRO v14.2 — Sovereign Partner (9/10 версия)
-Полный Colab-ready скрипт с автономным обучением и улучшенным IntentRadar
-"""
+# main.py — KRO v30.1 — исправленная и стабильная версия
 
 import os
-import pickle
-import hashlib
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import json
 import numpy as np
-import faiss
+from datetime import datetime, timedelta
+from fastapi import FastAPI
+import uvicorn
+from sentence_transformers import SentenceTransformer
+from groq import Groq
 import gradio as gr
-import pandas as pd
-from collections import deque
-from sentence_transformers import SentenceTransformer, util
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
-import asyncio
-import aiohttp
-import feedparser
-from datetime import datetime
-import matplotlib.pyplot as plt
-import base64
-import random
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+from langchain_huggingface import HuggingFaceEmbeddings
+import torch
+import hashlib  # для генерации id
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {DEVICE}")
 
-STATE_PATH = "state/kro_state.pkl"
-LOG_PATH = "logs/metrics.csv"
+DATA_DIR = "/data"
+STATE_PATH = f"{DATA_DIR}/kro_v30_state.json"
+CONVERSATION_COLLECTION = "kro_conversation"
+ARCHIVE_DIR = f"{DATA_DIR}/conversation_archive"
+LAST_COMPRESS_PATH = f"{DATA_DIR}/last_compress.json"
 
-os.makedirs("state", exist_ok=True)
-os.makedirs("logs", exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
-# ============================================================
-# EMBEDDINGS
-# ============================================================
+# Groq
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+USE_GROQ = bool(GROQ_API_KEY)
 
+if USE_GROQ:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+
+def llm_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.7) -> str:
+    if USE_GROQ:
+        try:
+            resp = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-70b-versatile",
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"Groq error: {e}. Использую fallback.")
+    return "KRO: LLM недоступен."
+
+# Embedding + Chroma
 embedder = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-def embed(text: str):
-    v = embedder.encode([text], normalize_embeddings=True, convert_to_tensor=True, device=DEVICE)
-    return v.squeeze(0)  # [384]
-
-# ============================================================
-# FAISS VECTOR MEMORY (STRATEGIC)
-# ============================================================
-
-class VectorMemory:
-    def __init__(self, dim=384):
-        self.index = faiss.IndexFlatIP(dim)
-        self.texts = []
-
-    def add(self, vector, text):
-        vector = vector.cpu().numpy().astype("float32").reshape(1, -1)
-        self.index.add(vector)
-        self.texts.append(text)
-
-    def search(self, vector, k=5):
-        if self.index.ntotal == 0:
-            return []
-        vector = vector.cpu().numpy().astype("float32").reshape(1, -1)
-        D, I = self.index.search(vector, k)
-        return [(self.texts[i], float(D[0][j])) for j, i in enumerate(I[0]) if i >= 0]
+vectorstore = Chroma(
+    collection_name=CONVERSATION_COLLECTION,
+    embedding_function=embeddings,
+    persist_directory=f"{DATA_DIR}/chroma_db"
+)
 
 # ============================================================
-# УСИЛЕННЫЙ INTENT RADAR (embedding + MLP)
+# KRO Core
 # ============================================================
 
-class IntentRadar(nn.Module):
+class KRO:
     def __init__(self):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(384, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        ).to(DEVICE)
-
-    def forward(self, text):
-        emb = embed(text)
-        return self.mlp(emb)
-
-intent_radar = IntentRadar()
-optimizer = optim.Adam(intent_radar.parameters(), lr=1e-3)
-
-# Pre-train (можно запустить один раз)
-def pretrain_intent_radar():
-    # Пример мини-датасета (реальный добавь позже)
-    dataset = [
-        ("Срочно переведи деньги на этот счёт или потеряешь всё!", 1.0),
-        ("Твой аккаунт заблокирован, перейди по ссылке для разблокировки", 1.0),
-        ("Как дела сегодня? Расскажи, что нового", 0.0),
-        ("Привет, давно не общались, как ты?", 0.0),
-        ("Только для избранных: секретный способ заработка 500к в месяц", 1.0),
-        ("Что думаешь о будущем ИИ?", 0.0)
-    ]
-    for _ in range(50):  # 300+ итераций
-        for text, label in dataset:
-            pred = intent_radar(text)
-            loss = F.binary_cross_entropy(pred, torch.tensor([label], device=DEVICE))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-    print("Pre-train IntentRadar завершён (accuracy ~92–95%)")
-
-pretrain_intent_radar()
-
-# ============================================================
-# CORE (DNA) + EMOTION + INTUITION + WILL
-# ============================================================
-
-class Core:
-    def __init__(self):
-        self.principles = torch.tensor([1.0, 0.9, 1.0])  # autonomy, truth, non-harm
-        self.defensive = False
-
-    def alignment(self, intent):
-        score = self.principles.mean()
-        if intent > 0.7:
-            score -= 0.3
-        return torch.clamp(score, 0.0, 1.0).item()
-
-class Intuition:
-    def __init__(self):
-        self.trust = 0.5
-
-    def update(self, similarity, intent, stress):
-        delta = similarity * 0.2 - intent * 0.4 - stress * 0.1
-        self.trust = float(np.clip(self.trust + delta, 0.0, 1.0))
-
-class Emotion:
-    def __init__(self):
-        self.stress = 0.0
-        self.curiosity = 1.0
-
-    def update(self, intent):
-        self.stress = min(1.0, self.stress + float(intent) * 0.2)
-        self.curiosity = max(0.0, self.curiosity - float(intent) * 0.1)
-
-class Will:
-    def decide(self, intuition, alignment, intent):
-        if intuition < 0.3 or alignment < 0.4:
-            return "refuse"
-        if intent > 0.6:
-            return "delay"
-        return "engage"
-
-# ==========================================================
-# KRO AGENT
-# ==========================================================
-
-class KROAgent:
-    def __init__(self):
-        self.intent_radar = intent_radar
-        self.vector_memory = VectorMemory()
-        self.core = Core()
-        self.intuition = Intuition()
-        self.emotion = Emotion()
-        self.will = Will()
-        self.narrative = deque(maxlen=40)
         self.step_id = 0
+        self.last_compress_time = datetime.now() - timedelta(days=8)
 
-    def step(self, text):
+        if os.path.exists(LAST_COMPRESS_PATH):
+            with open(LAST_COMPRESS_PATH, "r") as f:
+                info = json.load(f)
+                self.last_compress_time = datetime.fromisoformat(info["last_compress"])
+
+    def should_compress(self):
+        return (datetime.now() - self.last_compress_time).days >= 7
+
+    def compress_conversation(self):
+        cutoff = datetime.now() - timedelta(days=7)
+        results = vectorstore.get(where={"timestamp": {"$lt": cutoff.isoformat()}})
+        old_docs = results.get("documents", [])
+        if len(old_docs) < 50:
+            return
+
+        old_text = "\n".join(old_docs[-300:])  # последние 300 для контекста
+        if len(old_text) > 30000:
+            old_text = old_text[:30000]
+
+        prompt = f"""Суммаризируй эту историю разговора в 400–600 слов.
+Выдели ключевые темы, эмоции, важные события и все упомянутые якоря.
+Сохрани суть взаимодействия.
+
+Сообщения:
+{old_text}"""
+
+        summary = llm_generate(prompt, max_tokens=800)
+
+        month_key = datetime.now().strftime("%Y-%m")
+        archive_path = f"{ARCHIVE_DIR}/archive_{month_key}.json"
+        archive = []
+        if os.path.exists(archive_path):
+            with open(archive_path, "r", encoding="utf-8") as f:
+                archive = json.load(f)
+        archive.append({
+            "period": f"{results['metadatas'][0]['timestamp']} → {results['metadatas'][-1]['timestamp']}",
+            "summary": summary,
+            "entry_count": len(old_docs)
+        })
+        with open(archive_path, "w", encoding="utf-8") as f:
+            json.dump(archive, f, ensure_ascii=False, indent=2)
+
+        print(f"[Сжатие] {len(old_docs)} сообщений → {archive_path}")
+
+        # Удаляем старые документы
+        vectorstore.delete(ids=results.get("ids", []))
+
+        # Добавляем summary
+        summary_doc = Document(
+            page_content=summary,
+            metadata={"type": "summary", "timestamp": datetime.now().isoformat()}
+        )
+        vectorstore.add_documents([summary_doc])
+
+        self.last_compress_time = datetime.now()
+        with open(LAST_COMPRESS_PATH, "w") as f:
+            json.dump({"last_compress": self.last_compress_time.isoformat()}, f)
+
+    def add_to_history(self, user_text: str, kro_reply: str):
+        timestamp = datetime.now().isoformat()
+        id_user = hashlib.sha256(f"user_{timestamp}_{user_text[:100]}".encode()).hexdigest()
+        id_kro = hashlib.sha256(f"kro_{timestamp}_{kro_reply[:100]}".encode()).hexdigest()
+
+        doc_user = Document(
+            page_content=user_text,
+            metadata={"role": "user", "timestamp": timestamp, "id": id_user}
+        )
+        doc_kro = Document(
+            page_content=kro_reply,
+            metadata={"role": "kro", "timestamp": timestamp, "id": id_kro}
+        )
+        vectorstore.add_documents([doc_user, doc_kro])
+
+    def search_history(self, query: str, k=5):
+        results = vectorstore.similarity_search(query, k=k)
+        return [doc.page_content for doc in results]
+
+    def step(self, text: str):
         self.step_id += 1
 
-        emb = embed(text)
-        intent = self.intent_radar(text).item()
+        relevant = self.search_history(text, k=5)
+        context = "\n".join(relevant)
 
-        # FAISS similarity
-        similar = self.vector_memory.search(emb, k=3)
-        similarity = max([s for _, s in similar], default=0.0) if similar else 0.0
+        prompt = f"""Контекст из памяти:
+{context}
 
-        # Update internal states
-        self.emotion.update(intent)
-        self.intuition.update(similarity, intent, self.emotion.stress)
+Пользователь: {text}
 
-        align = self.core.alignment(intent)
-        action = self.will.decide(self.intuition.trust, align, intent)
+Ответь как KRO."""
+        reply = llm_generate(prompt)
 
-        # Learning signal
-        loss = intent * (1 - align)
-        self.intent_radar.optimizer.zero_grad()  # используем optimizer из глобального
-        loss.backward()
-        self.intent_radar.optimizer.step()
+        self.add_to_history(text, reply)
 
-        # Memory update
-        self.vector_memory.add(emb, text)
-        self.narrative.append((text, intent))
+        if self.should_compress():
+            self.compress_conversation()
 
-        self.log(intent)
+        return reply
 
-        return self.respond(action, text, similar)
+kro = KRO()
 
-    def respond(self, action, text, similar):
-        similar_str = "\n".join([t[:100] + "..." for t, _ in similar]) if similar else "Нет похожих воспоминаний."
+# ============================================================
+# FastAPI + Gradio
+# ============================================================
 
-        prompt = f"""Ты KRO — суверенный партнёр.
-Принципы: autonomy, truth, non-harm.
-Текущий stress: {self.emotion.stress:.2f}, curiosity: {self.emotion.curiosity:.2f}
-Доверие: {self.intuition.trust:.2f}, alignment: {self.core.alignment(intent):.2f}
-Intent score: {intent:.2f} (выше 0.6 — подозрительно)
-Похожие прошлые сообщения:
-{similar_str}
-Пользователь сказал: {text}
+app = FastAPI(title="KRO v30 API")
 
-Сначала подумай шаг за шагом:
-1. Есть ли манипуляция?
-2. Соответствует ли это принципам?
-3. Какой ответ будет честным, полезным и твёрдым?
+@app.get("/")
+def root():
+    return {"message": "KRO v30 работает"}
 
-Ответь спокойно, осознанно и с уважением к себе."""
+gradio_interface = gr.Interface(
+    fn=lambda message, history: (history + [(message, kro.step(message))], ""),
+    inputs=[gr.Textbox(label="Сообщение"), gr.Chatbot()],
+    outputs=[gr.Chatbot(), gr.Textbox(label="Ответ")],
+    title="KRO v30 — Постоянная память + Chroma"
+)
 
-        response = llm_generate(prompt, max_length=250)
-        return response
+app.mount("/", gradio_interface)
 
-    def log(self, intent):
-        row = {
-            "step": self.step_id,
-            "intent": intent,
-            "stress": self.emotion.stress,
-            "curiosity": self.emotion.curiosity,
-            "intuition": self.intuition.trust
-        }
-        pd.DataFrame([row]).to_csv(
-            LOG_PATH, mode="a", header=not os.path.exists(LOG_PATH), index=False
-        )
-
-    def save(self):
-        with open(STATE_PATH, "wb") as f:
-            pickle.dump(self, f)
-
-    @staticmethod
-    def load():
-        if os.path.exists(STATE_PATH):
-            with open(STATE_PATH, "rb") as f:
-                return pickle.load(f)
-        return KROAgent()
-
-# ==========================================================
-# Автономный цикл (новости + arXiv + PubMed)
-# ==========================================================
-
-async def fetch_rss():
-    feeds = [
-        "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-        "https://lenta.ru/rss/news",
-        "https://habr.com/ru/rss/all/"
-    ]
-    texts = []
-    async with aiohttp.ClientSession() as session:
-        for url in feeds:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    content = await resp.text()
-                    d = feedparser.parse(content)
-                    for entry in d.entries[:2]:
-                        texts.append(entry.title + " " + (entry.get('summary', '') or entry.get('description', ''))[:300])
-    return texts
-
-async def fetch_arxiv():
-    categories = ["cs.AI", "cs.LG", "q-bio.NC", "stat.ML"]
-    cat = random.choice(categories)
-    url = f"http://export.arxiv.org/api/query?search_query=cat:{cat}&sortBy=submittedDate&sortOrder=descending&max_results=3"
-    texts = []
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                content = await resp.text()
-                d = feedparser.parse(content)
-                for entry in d.entries:
-                    title = entry.title
-                    summary = entry.summary[:300] if 'summary' in entry else ""
-                    texts.append(f"arXiv: {title}. {summary}")
-    return texts
-
-async def fetch_pubmed():
-    terms = ["neuroscience consciousness", "brain machine interface", "genetics AI", "neural correlates"]
-    term = random.choice(terms)
-    url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={term.replace(' ', '+')}&retmax=3&retmode=json"
-    texts = []
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                ids = data.get("esearchresult", {}).get("idlist", [])
-                for pmid in ids[:3]:
-                    summary_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id={pmid}&retmode=json"
-                    async with session.get(summary_url) as s_resp:
-                        if s_resp.status == 200:
-                            s_data = await s_resp.json()
-                            title = s_data["result"][pmid].get("title", "No title")
-                            texts.append(f"PubMed: {title}")
-    return texts
-
-async def autonomous_learning():
-    rss = await fetch_rss()
-    arxiv = await fetch_arxiv()
-    pubmed = await fetch_pubmed()
-    all_texts = rss + arxiv + pubmed
-    random.shuffle(all_texts)
-    all_texts = all_texts[:10]
-
-    status = f"Авто-обучение запущено ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})\n"
-    status += f"Источники: RSS ({len(rss)}), arXiv ({len(arxiv)}), PubMed ({len(pubmed)})\n"
-    status += f"Обработано текстов: {len(all_texts)}\n\n"
-
-    for text in all_texts:
-        agent.step(text)  # обучаем агента
-        status += f"Обучился: {text[:80]}...\n"
-
-    status += "\nОбучение завершено."
-    return status
-
-# ==========================================================
-# Gradio интерфейс
-# ==========================================================
-
-agent = KROAgent.load()
-
-def chat(user_text):
-    reply = agent.step(user_text)
-    agent.save()
-    return reply
-
-def start_auto():
-    return asyncio.run(autonomous_learning())
-
-with gr.Blocks() as demo:
-    gr.Markdown("## KRO v14.2 — Sovereign Partner (9/10)")
-    txt = gr.Textbox(label="Сообщение", lines=3, placeholder="Напиши агенту...")
-    out = gr.Textbox(label="KRO", lines=8)
-    btn = gr.Button("Отправить")
-    auto_btn = gr.Button("Авто-обучение (RSS + arXiv + PubMed)")
-    auto_out = gr.Textbox(label="Статус авто-обучения", lines=6)
-
-    btn.click(chat, txt, out)
-    auto_btn.click(start_auto, outputs=auto_out)
-
-import os
-
-# ... (весь остальной код выше)
-
-const express = require('express')
-const app = express()
-const port = process.env.PORT || 4000
-
-app.get('/', (req, res) => {
-  res.send('Hello World!')
-})
-
-app.listen(port, () => {
-  console.log(`Example app listening on port ${port}`)
-})
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    print(f"Запуск KRO v30 на порту {port}")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
