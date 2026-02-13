@@ -167,17 +167,29 @@ kro = KRO()
 # FastAPI + Gradio
 # ============================================================
 
+from fastapi import FastAPI
+import gradio as gr
 import os
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+app = FastAPI(title="KRO v30 API")
 
 @app.get("/")
 def root():
-    return {"status": "alive"}
+    return {"status": "KRO v30 alive"}
+
+# создаём интерфейс
+gradio_interface = gr.Interface(
+    fn=lambda message, history: (history + [(message, kro.step(message))], ""),
+    inputs=[gr.Textbox(label="Сообщение"), gr.Chatbot()],
+    outputs=[gr.Chatbot(), gr.Textbox(label="Ответ")],
+    title="KRO v30 — Постоянная память + Chroma"
+)
+
+# ВАЖНО: mount на /ui
+app = gr.mount_gradio_app(app, gradio_interface, path="/ui")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    print(f"Запуск KRO v30 на порту {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
