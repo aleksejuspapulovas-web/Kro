@@ -1,4 +1,4 @@
-torch==2.0.1+cpu
+torch
 sentence-transformers
 transformers
 uvicorn==0.30.6
